@@ -1,0 +1,459 @@
+"""Gmail source adapter.
+
+Read-only. Imports of ``googleapiclient`` are lazy so the core package stays
+importable (and testable) without the optional dependency installed. When
+credentials are missing the adapter reports itself unavailable with an
+actionable reason instead of raising - that becomes a BLOCKED report, not a
+crash.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import re
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
+from enum import Enum
+from typing import Any
+
+from .sources import RawMessage
+
+_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+_TAG_RE = re.compile(r"<(script|style)[^>]*>.*?</\\1>", re.IGNORECASE | re.DOTALL)
+_BR_RE = re.compile(r"<br\\s*/?>", re.IGNORECASE)
+_P_RE = re.compile(r"</p\\s*>", re.IGNORECASE)
+_ANY_TAG_RE = re.compile(r"<[^>]+>")
+
+# OAuth client types Google issues. Anything else is not a usable desktop client.
+_VALID_CLIENT_KINDS = ("installed", "web")
+
+
+class GmailStatus(str, Enum):
+    """Explicit outcome of a Gmail read attempt.
+
+    ``OK`` and ``OK_EMPTY`` are the only values that mean Google actually served
+    the request. ``CONFIGURED`` means credentials look usable but no read has
+    been attempted - it is explicitly *not* a success claim.
+    """
+
+    CONFIGURED = "configured"
+    OK = "ok"
+    OK_EMPTY = "ok_empty"
+    MISSING_CONFIG = "missing_config"
+    MISSING_CREDENTIALS_FILE = "missing_credentials_file"
+    INVALID_CREDENTIALS = "invalid_credentials"
+    AUTH_FAILED = "auth_failed"
+    DEPENDENCY_MISSING = "dependency_missing"
+    API_ERROR = "api_error"
+
+
+class GmailError(RuntimeError):
+    """Raised when Gmail cannot be read. ``status`` is always set."""
+
+    def __init__(self, status: GmailStatus, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+@dataclass
+class GmailResult:
+    """Result of a Gmail read.
+
+    ``messages`` is only non-empty when ``status`` is ``OK``. ``scanned`` is
+    True only when the API call actually succeeded - it must never be asserted
+    from the mere absence of an exception.
+
+    Field order matters: ``reason`` is second so that ``GmailResult(status,
+    reason)`` is the natural way to report a failure.
+    """
+
+    status: GmailStatus
+    reason: str = ""
+    messages: list[RawMessage] = field(default_factory=list)
+    message_ids_seen: int = 0
+
+    @property
+    def scanned(self) -> bool:
+        return self.status in {GmailStatus.OK, GmailStatus.OK_EMPTY}
+
+    @property
+    def read_count(self) -> int:
+        return len(self.messages)
+
+    def summary(self) -> str:
+        if self.status == GmailStatus.OK:
+            return f"Retrieved {len(self.messages)} message(s) from Gmail."
+        if self.status == GmailStatus.OK_EMPTY:
+            return (
+                "Gmail read succeeded but the search matched 0 messages. "
+                "No email was read."
+            )
+        if self.status == GmailStatus.CONFIGURED:
+            return (
+                "Gmail credentials look usable, but no read has been attempted. "
+                "No inbox data was read."
+            )
+        return f"Gmail read did not succeed ({self.status.value}): {self.reason}"
+
+
+class GmailSource:
+    """Read-only Gmail access via OAuth.
+
+    This adapter never mutates mail. It calls only ``users.messages.list`` and
+    ``users.messages.get``, both under the ``gmail.readonly`` scope.
+    """
+
+    name = "gmail"
+
+    def __init__(self, config: Any) -> None:
+        self._config = config
+        self._service: Any | None = None
+
+    # -- availability ---------------------------------------------------
+
+    def available(self) -> tuple[bool, str]:
+        gmail = self._config.gmail
+        if gmail.credentials_path is None:
+            return (
+                False,
+                "GMAIL_CREDENTIALS_PATH is not set. Create OAuth desktop credentials "
+                "in Google Cloud Console, download the JSON, and set the path.",
+            )
+        if not gmail.credentials_path.is_file():
+            return (False, f"Gmail credentials file not found: {gmail.credentials_path}")
+        if gmail.token_path is None:
+            return (False, "GMAIL_TOKEN_PATH is not set.")
+        return (True, "configured")
+
+    def diagnose(self) -> GmailResult:
+        """Check configuration without contacting Google.
+
+        Separates "not configured" from "configured but unusable" so the report
+        can say which one it is.
+        """
+
+        gmail = self._config.gmail
+        if gmail.credentials_path is None:
+            return GmailResult(
+                GmailStatus.MISSING_CONFIG,
+                "GMAIL_CREDENTIALS_PATH is not set. No inbox data was read.",
+            )
+        if gmail.token_path is None:
+            return GmailResult(
+                GmailStatus.MISSING_CONFIG,
+                "GMAIL_TOKEN_PATH is not set. No inbox data was read.",
+            )
+        if not gmail.credentials_path.is_file():
+            return GmailResult(
+                GmailStatus.MISSING_CREDENTIALS_FILE,
+                f"Credentials file not found at {gmail.credentials_path}. "
+                "No inbox data was read.",
+            )
+
+        problem = self._validate_client_file(gmail.credentials_path)
+        if problem:
+            return GmailResult(
+                GmailStatus.INVALID_CREDENTIALS,
+                f"{problem} No inbox data was read.",
+            )
+
+        if gmail.token_path.is_file():
+            try:
+                json.loads(gmail.token_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as exc:
+                return GmailResult(
+                    GmailStatus.INVALID_CREDENTIALS,
+                    f"Cached token at {gmail.token_path} is unreadable ({exc}). "
+                    "Delete it and re-run to re-authenticate. No inbox data was read.",
+                )
+
+        return GmailResult(
+            GmailStatus.CONFIGURED, reason="credentials and token path look usable"
+        )
+
+    # -- auth -----------------------------------------------------------
+
+    def _authenticate(self) -> Any:
+        if self._service is not None:
+            return self._service
+
+        try:
+            from google.auth.transport.requests import Request
+            from google.oauth2.credentials import Credentials
+            from googleapiclient.discovery import build
+        except ImportError as exc:  # pragma: no cover - depends on optional extra
+            raise GmailError(
+                GmailStatus.DEPENDENCY_MISSING,
+                "Gmail support requires optional dependencies. Install with: "
+                "pip install 'hackforge[gmail]'",
+            ) from exc
+
+        gmail = self._config.gmail
+
+        problem = self._validate_client_file(gmail.credentials_path)
+        if problem:
+            raise GmailError(GmailStatus.INVALID_CREDENTIALS, problem)
+
+        credentials = None
+        if gmail.token_path.is_file():
+            try:
+                credentials = Credentials.from_authorized_user_file(
+                    str(gmail.token_path), _SCOPES
+                )
+            except (ValueError, json.JSONDecodeError, OSError) as exc:
+                raise GmailError(
+                    GmailStatus.INVALID_CREDENTIALS,
+                    f"Cached token is unusable: {exc}. Delete {gmail.token_path} "
+                    "and re-run.",
+                ) from exc
+            if credentials and credentials.expired and credentials.refresh_token:
+                try:
+                    credentials.refresh(Request())
+                except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                    raise GmailError(
+                        GmailStatus.AUTH_FAILED,
+                        f"Token refresh was rejected by Google: {exc}",
+                    ) from exc
+
+        if not credentials or not credentials.valid:
+            try:
+                from google_auth_oauthlib.flow import InstalledAppFlow
+
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    str(gmail.credentials_path), _SCOPES
+                )
+                credentials = flow.run_local_server(port=0)
+            except Exception as exc:  # noqa: BLE001 - OAuth consent/parse failures
+                raise GmailError(
+                    GmailStatus.AUTH_FAILED,
+                    f"OAuth authorisation did not complete: {exc}",
+                ) from exc
+
+            gmail.token_path.parent.mkdir(parents=True, exist_ok=True)
+            gmail.token_path.write_text(credentials.to_json(), encoding="utf-8")
+
+        try:
+            self._service = build("gmail", "v1", credentials=credentials)
+        except Exception as exc:  # noqa: BLE001
+            raise GmailError(
+                GmailStatus.AUTH_FAILED, f"Gmail client could not be constructed: {exc}"
+            ) from exc
+        return self._service
+
+    # -- reachability (read-only probe, gmail.readonly only) -------------
+
+    def reach(self) -> tuple[bool, str]:
+        """Ask Google for a read-only, non-mail piece of profile data.
+
+        Returns (True, masked_address) on success. This is a single, read-only,
+        billable-request probe under the same scope as the Gmail reads; it does
+        not list, get, modify, send or compose anything.
+        """
+
+        service = self._service
+        if service is None:
+            try:
+                service = self._authenticate()
+            except GmailError as exc:
+                return (False, f"auth error: {exc}")
+
+        try:
+            profile = (
+                service.users()
+                .getProfile(userId="me", fields="emailAddress,messagesTotal")
+                .execute()
+            )
+        except Exception as exc:  # noqa: BLE001
+            return (False, f"api error: {exc}")
+
+        address = profile.get("emailAddress", "")
+        if "@" in address:
+            local, _, domain = address.partition("@")
+            masked = local[:2] + "***@" + domain
+        else:
+            masked = "***"
+
+        return (True, f"users.getProfile returned 200; account={masked}")
+
+    # -- fetch ----------------------------------------------------------
+
+    def fetch(self, limit: int | None = None) -> list[RawMessage]:
+        """Read messages. Raises ``GmailError`` with an explicit status on failure."""
+
+        return self.fetch_detailed(limit).messages
+
+    def fetch_detailed(self, limit: int | None = None) -> GmailResult:
+        """Read messages and report exactly what happened.
+
+        The returned ``scanned`` flag is True only when Google actually served
+        the request. Configuration problems and auth failures return a non-OK
+        status with no messages.
+        """
+
+        diagnosis = self.diagnose()
+        if diagnosis.status is not GmailStatus.CONFIGURED:
+            # MISSING_CONFIG / INVALID_CREDENTIALS / MISSING_CREDENTIALS_FILE
+            # all mean no read can be attempted at all.
+            return diagnosis
+
+        try:
+            service = self._authenticate()
+        except GmailError as exc:
+            return GmailResult(exc.status, reason=str(exc))
+
+        gmail = self._config.gmail
+        max_results = limit or gmail.max_messages
+
+        try:
+            listing = (
+                service.users()
+                .messages()
+                .list(userId="me", q=gmail.query, maxResults=max_results)
+                .execute()
+            )
+        except Exception as exc:  # noqa: BLE001 - API/network failure
+            return GmailResult(
+                GmailStatus.API_ERROR,
+                reason=f"Gmail list call failed: {exc}",
+            )
+
+        messages = (listing or {}).get("messages") or []
+        if not messages:
+            return GmailResult(
+                GmailStatus.OK_EMPTY,
+                reason=(
+                    f"Gmail search '{gmail.query}' matched 0 messages. "
+                    "The API call succeeded; no email was read."
+                ),
+                message_ids_seen=0,
+            )
+
+        results: list[RawMessage] = []
+        for item in messages:
+            message_id = (item or {}).get("id")
+            if not message_id:
+                continue
+            try:
+                payload = (
+                    service.users()
+                    .messages()
+                    .get(userId="me", id=message_id, format="full")
+                    .execute()
+                )
+            except Exception as exc:  # noqa: BLE001 - skip unreadable message
+                continue
+            if not isinstance(payload, dict):
+                continue
+            message = self._normalise(payload)
+            if message is not None:
+                results.append(message)
+
+        return GmailResult(
+            GmailStatus.OK,
+            messages=results,
+            reason=f"Retrieved {len(results)} of {len(messages)} message(s).",
+            message_ids_seen=len(messages),
+        )
+
+    def _normalise(self, payload: dict[str, Any]) -> RawMessage | None:
+        def decode(data: str | None) -> str:
+            if not data:
+                return ""
+            try:
+                return base64.urlsafe_b64decode(data).decode("utf-8", "replace")
+            except Exception:
+                return ""
+
+        raw_payload = payload.get("payload")
+        if not isinstance(raw_payload, dict):
+            raw_payload = {}
+
+        headers = {}
+        for header in raw_payload.get("headers", []) or []:
+            if not isinstance(header, dict):
+                continue
+            name = header.get("name")
+            if name:
+                headers[name.lower()] = header.get("value", "")
+
+        plain_parts: list[str] = []
+        html_parts: list[str] = []
+        parts = raw_payload.get("parts", []) or []
+
+        def walk(part: dict[str, Any]) -> None:
+            if not isinstance(part, dict):
+                return
+            mime = part.get("mimeType", "")
+            body = part.get("body") or {}
+            if not isinstance(body, dict):
+                body = {}
+            data = body.get("data")
+            if mime == "text/plain" and data:
+                plain_parts.append(decode(data))
+            elif mime == "text/html" and data:
+                html_parts.append(decode(data))
+            for child in part.get("parts", []) or []:
+                walk(child)
+
+        if parts:
+            for part in parts:
+                walk(part)
+        else:
+            walk(raw_payload)
+
+        body_text = "\\n".join(plain_parts).strip()
+        html_text = "\\n".join(html_parts).strip()
+        if not body_text and html_text:
+            body_text = self._html_to_text(html_text)
+
+        received = self._parse_date(headers.get("date"))
+        sender_raw = headers.get("from", "")
+        sender_name, sender_email = self._split_sender(sender_raw)
+
+        return RawMessage(
+            message_id=payload.get("id", ""),
+            thread_id=payload.get("threadId"),
+            subject=headers.get("subject", ""),
+            body=body_text,
+            sender=sender_email,
+            sender_name=sender_name,
+            received_at=received,
+            source_kind="email",
+            source_label=self.name,
+            raw_headers=headers,
+            html_body=html_text,
+        )
+
+    @staticmethod
+    def _html_to_text(html: str) -> str:
+        stripped = _TAG_RE.sub(" ", html)
+        stripped = _BR_RE.sub("\\n", stripped)
+        stripped = _P_RE.sub("\\n", stripped)
+        stripped = _ANY_TAG_RE.sub(" ", stripped)
+        import html as html_module
+
+        stripped = html_module.unescape(stripped)
+        return re.sub(r"[ \\t]{2,}", " ", stripped).strip()
+
+    @staticmethod
+    def _split_sender(raw: str) -> tuple[str, str]:
+        match = re.match(r"^\\s*(.*?)\\s*<([^>]+)>\\s*$", raw or "")
+        if match:
+            return match.group(1).strip('\\"\\''), match.group(2).strip()
+        return "", (raw or "").strip()
+
+    @staticmethod
+    def _parse_date(raw: str | None) -> date | None:
+        if not raw:
+            return None
+        try:
+            parsed = parsedate_to_datetime(raw)
+        except (TypeError, ValueError):
+            return None
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).date()

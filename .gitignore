@@ -1,0 +1,28 @@
+# Secrets and credentials - never commit
+.env
+gmail_credentials.json
+gmail_token.json
+*_token.json
+*.credentials.json
+
+# State
+.hackforge/
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
